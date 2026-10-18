@@ -1,1 +1,2 @@
-# Finalmente colocando o codigo do artigo no Git.
+Aqui esta todo o código utilizado para a finalização do artigo que vou defender na Fatec.
+Nao sei usar o Github direito (deveria), espero utilizar isso aqui para trabalhos futuros... 
