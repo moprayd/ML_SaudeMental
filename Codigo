@@ -1,0 +1,301 @@
+from pathlib import Path
+import warnings
+from tqdm import tqdm
+
+import numpy as np
+import pandas as pd
+import torch
+
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.model_selection import (
+    train_test_split,
+    StratifiedKFold,
+    ParameterGrid
+)
+from sklearn.metrics import (
+    classification_report,
+    confusion_matrix,
+    accuracy_score,
+    balanced_accuracy_score,
+    f1_score,
+    precision_score,
+    recall_score
+)
+from sklearn.dummy import DummyClassifier
+
+# Configuração de Dispositivo GPU/CPU via PyTorch
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if DEVICE.type == "cuda":
+    print(f"[INFO] GPU Detectada ({torch.cuda.get_device_name(0)}). O KNN será acelerado via PyTorch.")
+else:
+    print("[AVISO] GPU não detectada ou indisponível. Utilizando CPU.")
+
+
+
+# 1. CONFIGURAÇÕES E VARIÁVEIS GLOBAIS
+
+DATA_PATH = Path("NSDUH_2021_2024_Tab.tsv")
+TARGET = "MENTAL_HEALTH_STATUS"
+TEST_SIZE = 0.2
+RANDOM_STATE = 42
+
+CLASS_NAMES = {
+    0: "Sem AMI no último ano",
+    1: "AMI, mas sem SMI",
+    2: "SMI (Doença Mental Grave)"
+}
+
+
+# 2. FUNÇÃO AUXILIAR DE KNN VIA PYTORCH
+
+class PyTorchKNNClassifier:
+    def __init__(self, n_neighbors=5, metric="euclidean", batch_size=1000):
+        self.n_neighbors = n_neighbors
+        self.metric = metric
+        self.batch_size = batch_size
+        self.X_train_t = None
+        self.y_train_t = None
+
+    def fit(self, X, y):
+        # Converter dados de treino para tensores e enviar para o dispositivo (GPU/CPU)
+        self.X_train_t = torch.tensor(X, dtype=torch.float32, device=DEVICE)
+        self.y_train_t = torch.tensor(
+            y.to_numpy() if hasattr(y, "to_numpy") else np.array(y), 
+            dtype=torch.long, 
+            device=DEVICE
+        )
+        return self
+
+    def predict(self, X):
+        X_test_t = torch.tensor(X, dtype=torch.float32, device=DEVICE)
+        y_pred_list = []
+        
+        p = 2.0 if self.metric == "euclidean" else 1.0
+
+        with torch.no_grad():
+            for i in range(0, X_test_t.shape[0], self.batch_size):
+                X_batch = X_test_t[i : i + self.batch_size]
+                
+                # Cálculo de distância vetorizado e paralelo na GPU
+                distances = torch.cdist(X_batch, self.X_train_t, p=p)
+                
+                # Encontrar os K menores vizinhos
+                k = min(self.n_neighbors, self.X_train_t.shape[0])
+                _, topk_indices = torch.topk(distances, k=k, largest=False, sorted=True)
+                
+                # Recuperar os rótulos correspondentes dos vizinhos
+                neighbor_labels = self.y_train_t[topk_indices]
+                
+                # Votação majoritária
+                for row in neighbor_labels:
+                    counts = torch.bincount(row, minlength=len(CLASS_NAMES))
+                    pred_class = torch.argmax(counts).item()
+                    y_pred_list.append(pred_class)
+                    
+        return np.array(y_pred_list)
+
+
+
+# 3. CARREGAMENTO DOS DADOS 
+
+print("\n[1/7] Carregando o dataset...")
+with tqdm(total=1, desc="Lendo arquivo TSV") as pbar:
+    df = pd.read_csv(DATA_PATH, sep="\t", low_memory=False)
+    pbar.update(1)
+
+# Normalizar nomes das colunas
+df.columns = (
+    df.columns.astype(str)
+    .str.replace("\ufeff", "", regex=False)
+    .str.strip()
+    .str.upper()
+)
+
+print(f"Dataset shape: {df.shape}")
+
+required_columns = ["AGE3", "AMIPY", "SMIPY"]
+assert all(col in df.columns for col in required_columns), (
+    "Colunas obrigatórias ausentes. Verifique o delimitador do arquivo."
+)
+
+# Definir características candidatas
+categorical_features = ["AGE3", "SEXAGE", "NEWRACE2", "IRMARIT", "EDUHIGHCAT", "ENRLCOLLFT2", "ENRLCOLLST2", "IRWRKSTAT", "WRKSTATWK2"]
+ordinal_features = ["IREDUHIGHST2", "INCOME", "POVERTY3", "IRFAMIN3", "WRKNUMJOB2"]
+numeric_features = ["WRKDHRSWK2", "IRALCAGE", "IRALCYFU", "IRALCBNG30D"]
+binary_features = ["ALCYR", "ALCMON"]
+
+candidate_features = categorical_features + ordinal_features + numeric_features + binary_features
+available_features = [col for col in candidate_features if col in df.columns]
+
+# Filtrar listas por colunas disponíveis
+categorical_features = [col for col in categorical_features if col in available_features]
+ordinal_features = [col for col in ordinal_features if col in available_features]
+numeric_features = [col for col in numeric_features if col in available_features]
+binary_features = [col for col in binary_features if col in available_features]
+
+
+
+
+print("\n[2/7] Convertendo variáveis e filtrando adultos...")
+columns_to_convert = list(dict.fromkeys(required_columns + available_features))
+
+for col in tqdm(columns_to_convert, desc="Convertendo colunas para numérico"):
+    df[col] = pd.to_numeric(df[col], errors="coerce")
+
+# Filtrar para adultos (AGE3 entre 4 e 11)
+df_adult = df.loc[df["AGE3"].between(4, 11)].copy()
+
+# Validação lógica do Target (SMIPY e AMIPY)
+valid_target = df_adult["AMIPY"].isin([0, 1]) & df_adult["SMIPY"].isin([0, 1])
+logical_consistency = (df_adult["SMIPY"] == 0) | ((df_adult["SMIPY"] == 1) & (df_adult["AMIPY"] == 1))
+
+df_adult = df_adult.loc[valid_target & logical_consistency].copy()
+
+# Criar target multiclasse
+df_adult[TARGET] = np.select(
+    [df_adult["SMIPY"].eq(1), df_adult["AMIPY"].eq(1)],
+    [2, 1],
+    default=0
+).astype(int)
+
+
+# 5. LIMPEZA DE CÓDIGOS ESPECIAIS E ENGENHARIA DE ATRIBUTOS
+
+
+print("\n[3/7] Limpando códigos especiais e tratando valores ausentes...")
+
+special_codes = {
+    "IRMARIT": [99],
+    "EDUHIGHCAT": [5],
+    "WRKNUMJOB2": [85, 94, 97, 98, 99],
+    "WRKDHRSWK2": [985, 994, 997, 998, 999],
+    "IRALCAGE": [991],
+    "IRALCYFU": [9999],
+}
+
+for col, codes in tqdm(special_codes.items(), desc="Aplicando códigos especiais"):
+    if col in df_adult.columns:
+        df_adult[col] = df_adult[col].replace(codes, np.nan)
+
+if "WRKSTATWK2" in df_adult.columns:
+    df_adult["WRKSTATWK2"] = df_adult["WRKSTATWK2"].replace([98, 99], np.nan)
+if "IRWRKSTAT" in df_adult.columns:
+    df_adult["IRWRKSTAT"] = df_adult["IRWRKSTAT"].replace([99], np.nan)
+
+# Tratamento de binge drinking
+if "IRALCBNG30D" in df_adult.columns:
+    df_adult["ALC_BINGE_NEVER_USED"] = df_adult["IRALCBNG30D"].eq(91).astype(int)
+    df_adult["ALC_BINGE_NO_USE_PAST_MONTH"] = df_adult["IRALCBNG30D"].eq(93).astype(int)
+    df_adult["IRALCBNG30D"] = df_adult["IRALCBNG30D"].replace({91: 0, 93: 0})
+    invalid_binge = ~df_adult["IRALCBNG30D"].between(0, 30) & df_adult["IRALCBNG30D"].notna()
+    df_adult.loc[invalid_binge, "IRALCBNG30D"] = np.nan
+
+binary_features += [col for col in ["ALC_BINGE_NEVER_USED", "ALC_BINGE_NO_USE_PAST_MONTH"] if col in df_adult.columns]
+available_features = categorical_features + ordinal_features + numeric_features + binary_features
+
+# Remover colunas constantes
+constant_features = [col for col in available_features if df_adult[col].nunique(dropna=True) <= 1]
+if constant_features:
+    available_features = [col for col in available_features if col not in constant_features]
+    categorical_features = [col for col in categorical_features if col in available_features]
+    ordinal_features = [col for col in ordinal_features if col in available_features]
+    numeric_features = [col for col in numeric_features if col in available_features]
+    binary_features = [col for col in binary_features if col in available_features]
+
+X = df_adult[available_features].copy()
+y = df_adult[TARGET].copy()
+rows_with_any_feature = X.notna().any(axis=1)
+X, y = X.loc[rows_with_any_feature].copy(), y.loc[rows_with_any_feature].copy()
+
+
+
+# 6. DIVISÃO TREINO/TESTE E PRÉ-PROCESSAMENTO
+
+
+print("\n[4/7] Dividindo conjuntos de treino e teste...")
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE, stratify=y
+)
+
+categorical_pipeline = Pipeline([("imputer", SimpleImputer(strategy="most_frequent")), ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False))])
+ordinal_pipeline = Pipeline([("imputer", SimpleImputer(strategy="median")), ("scaler", StandardScaler())])
+numeric_pipeline = Pipeline([("imputer", SimpleImputer(strategy="median")), ("scaler", StandardScaler())])
+binary_pipeline = Pipeline([("imputer", SimpleImputer(strategy="most_frequent")), ("scaler", StandardScaler())])
+
+transformers = []
+if categorical_features: transformers.append(("categorical", categorical_pipeline, categorical_features))
+if ordinal_features: transformers.append(("ordinal", ordinal_pipeline, ordinal_features))
+if numeric_features: transformers.append(("numeric", numeric_pipeline, numeric_features))
+if binary_features: transformers.append(("binary", binary_pipeline, binary_features))
+
+preprocessor = ColumnTransformer(transformers=transformers, remainder="drop")
+
+print("Ajustando transformações no conjunto de treino...")
+X_train_transformed = preprocessor.fit_transform(X_train)
+X_test_transformed = preprocessor.transform(X_test)
+
+
+
+# 7. TREINAMENTO E VALIDAÇÃO CRUZADA 
+
+
+print("\n[5/7] Executando Validação Cruzada e Otimização de Hiperparâmetros")
+
+minimum_class_count = int(y_train.value_counts().min())
+n_splits = min(10, minimum_class_count)
+cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_STATE)
+
+# Definir grade de parâmetros (pesos uniformes por padrão no KNN vetorial)
+param_grid = {
+    "n_neighbors": [k for k in [3, 5, 7] if k < len(X_train_transformed)],
+    "metric": ["euclidean", "manhattan"],
+}
+
+grid = list(ParameterGrid(param_grid))
+best_score = -1
+best_params = None
+
+# Loop manual com tqdm para acompanhar a busca em grade
+for params in tqdm(grid, desc="Grid Search (PyTorch GPU)"):
+    fold_scores = []
+    for train_idx, val_idx in cv.split(X_train_transformed, y_train):
+        X_tr, X_va = X_train_transformed[train_idx], X_train_transformed[val_idx]
+        y_tr, y_va = y_train.iloc[train_idx], y_train.iloc[val_idx]
+        
+        clf = PyTorchKNNClassifier(n_neighbors=params["n_neighbors"], metric=params["metric"])
+        clf.fit(X_tr, y_tr)
+        preds = clf.predict(X_va)
+            
+        score = f1_score(y_va, preds, average="macro", zero_division=0)
+        fold_scores.append(score)
+        
+    mean_score = np.mean(fold_scores)
+    if mean_score > best_score:
+        best_score = mean_score
+        best_params = params
+
+print(f"\nMelhores Parâmetros: {best_params}")
+print(f"Melhor F1-Macro na Validação Cruzada: {best_score:.4f}")
+
+
+
+# 8. TREINAMENTO FINAL E AVALIAÇÃO NO TESTE
+
+
+print("\n[6/7] Treinando modelo final com os melhores parâmetros...")
+final_model = PyTorchKNNClassifier(**best_params)
+final_model.fit(X_train_transformed, y_train)
+y_pred = final_model.predict(X_test_transformed)
+
+print("\n[7/7] Gerando métricas finais...")
+print("-" * 50)
+print(f"Acurácia: {accuracy_score(y_test, y_pred):.4f}")
+print(f"Acurácia Balanceada: {balanced_accuracy_score(y_test, y_pred):.4f}")
+print(f"F1-Macro: {f1_score(y_test, y_pred, average='macro', zero_division=0):.4f}")
+print("-" * 50)
+
+print("\nRelatório de Classificação:")
+print(classification_report(y_test, y_pred, labels=[0, 1, 2], target_names=list(CLASS_NAMES.values()), zero_division=0))
