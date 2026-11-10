@@ -1,0 +1,24 @@
+# Dados (nao versionar: arquivo grande e distribuido pela SAMHSA)
+*.tsv
+*.csv
+*.zip
+*.sav
+*.dta
+*.rds
+
+# Saidas geradas pelo script
+matriz_confusao_*.png
+tempos_execucao.csv
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Editor / sistema
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

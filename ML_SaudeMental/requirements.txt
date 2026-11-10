@@ -1,0 +1,12 @@
+# Python 3.13 (testado). Para fixar as versoes exatas da sua maquina, rode: pip freeze > requirements-lock.txt
+numpy
+pandas
+scikit-learn
+tqdm
+matplotlib
+imbalanced-learn   # so necessario para os modos "random" e "smote"
+
+# PyTorch: instale a build com CUDA para usar a GPU (testado com torch 2.11.0+cu128):
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+# Sem GPU, "pip install torch" funciona, mas a busca em grade fica bem mais lenta.
+torch
